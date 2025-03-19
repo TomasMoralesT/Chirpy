@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync/atomic"
 )
 
@@ -71,7 +72,7 @@ func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
 func (cfg *apiConfig) validateChirp(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error": "Invalid request method"}`, http.StatusMethodNotAllowed)
+		respondWithError(w, http.StatusMethodNotAllowed, "Invalid request method")
 		return
 	}
 
@@ -84,32 +85,37 @@ func (cfg *apiConfig) validateChirp(w http.ResponseWriter, r *http.Request) {
 	err := decoder.Decode(&params)
 	if err != nil {
 		log.Printf("Error decoding parameters: %s", err)
-		w.WriteHeader(500)
+		respondWithError(w, http.StatusInternalServerError, "Error decoding request body")
 		return
 	}
 
 	if len(params.Body) > 140 {
-		response := map[string]string{"error": "Chirp is too long"}
-		respJSON, err := json.Marshal(response)
-		if err != nil {
-			log.Printf("Error marshalling JSON: %s", err)
-			w.WriteHeader(500)
-			return
+		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
+		return
+	}
+
+	cleanedBody := cleanProfanity(params.Body)
+
+	response := map[string]string{"cleaned_body": cleanedBody}
+	respondWithJSON(w, http.StatusOK, response)
+}
+
+func cleanProfanity(msg string) string {
+	if len(msg) < 1 {
+		return msg
+	}
+	splittedMsg := strings.Split(msg, " ")
+
+	var wordList []string
+
+	for _, word := range splittedMsg {
+		if strings.ToLower(word) == "kerfuffle" ||
+			strings.ToLower(word) == "sharbert" ||
+			strings.ToLower(word) == "fornax" {
+			word = "****"
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(400)
-		w.Write(respJSON)
-		return
+		wordList = append(wordList, word)
 	}
-	response := map[string]bool{"valid": true}
-	respJSON, err := json.Marshal(response)
-	if err != nil {
-		log.Printf("Error marshalling JSON: %s", err)
-		w.WriteHeader(500)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
-	w.Write(respJSON)
-	return
+
+	return strings.Join(wordList, " ")
 }
