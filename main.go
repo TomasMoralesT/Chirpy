@@ -62,7 +62,7 @@ func main() {
 
 	newMux.HandleFunc("POST /api/chirps", cfg.createChirp)
 
-	newMux.HandleFunc("/api/validate_chirp", cfg.validateChirp)
+	newMux.HandleFunc("GET /api/chirps", cfg.getChirps)
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -211,37 +211,6 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(responseChirp)
 }
 
-func (cfg *apiConfig) validateChirp(w http.ResponseWriter, r *http.Request) {
-
-	if r.Method != http.MethodPost {
-		respondWithError(w, http.StatusMethodNotAllowed, "Invalid request method")
-		return
-	}
-
-	type parameters struct {
-		Body string `json:"body"`
-	}
-
-	decoder := json.NewDecoder(r.Body)
-	params := parameters{}
-	err := decoder.Decode(&params)
-	if err != nil {
-		log.Printf("Error decoding parameters: %s", err)
-		respondWithError(w, http.StatusInternalServerError, "Error decoding request body")
-		return
-	}
-
-	if len(params.Body) > 140 {
-		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
-		return
-	}
-
-	cleanedBody := cleanProfanity(params.Body)
-
-	response := map[string]string{"cleaned_body": cleanedBody}
-	respondWithJSON(w, http.StatusOK, response)
-}
-
 func cleanProfanity(msg string) string {
 	if len(msg) < 1 {
 		return msg
@@ -260,4 +229,35 @@ func cleanProfanity(msg string) string {
 	}
 
 	return strings.Join(wordList, " ")
+}
+
+func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
+
+	dbChirps, err := cfg.queries.GetChirps(r.Context())
+	if err != nil {
+		log.Printf("Error getting chirps: %s", err)
+		respondWithError(w, http.StatusInternalServerError, "Error getting chirps")
+		return
+	}
+
+	chirps := []Chirp{}
+	for _, dbChirp := range dbChirps {
+		chirps = append(chirps, Chirp{
+			ID:        dbChirp.ID,
+			CreatedAt: dbChirp.CreatedAt,
+			UpdatedAt: dbChirp.UpdatedAt,
+			UserID:    dbChirp.UserID,
+			Body:      dbChirp.Body,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(w).Encode(chirps)
+	if err != nil {
+		log.Printf("Error encoding chirps: %s", err)
+		respondWithError(w, http.StatusInternalServerError, "Error encoding chirps")
+		return
+	}
 }
