@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/google/uuid"
+
 	"github.com/TomasMoralesT/Chirpy/internal/database"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -57,6 +59,8 @@ func main() {
 	newMux.HandleFunc("POST /admin/reset", cfg.resetHandler)
 
 	newMux.HandleFunc("POST /api/users", cfg.createUser)
+
+	newMux.HandleFunc("POST /api/chirps", cfg.createChirp)
 
 	newMux.HandleFunc("/api/validate_chirp", cfg.validateChirp)
 
@@ -141,9 +145,70 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated) // 201 Created
+	w.WriteHeader(http.StatusCreated)
 
 	json.NewEncoder(w).Encode(responseUser)
+}
+
+func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		respondWithError(w, http.StatusMethodNotAllowed, "Invalid request method")
+		return
+	}
+
+	type parameters struct {
+		Body   string `json:"body"`
+		UserID string `json:"user_id"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		log.Printf("Error decoding parameters: %s", err)
+		respondWithError(w, http.StatusInternalServerError, "Error decoding request body")
+		return
+	}
+
+	if len(params.Body) > 140 {
+		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
+		return
+	}
+
+	cleanedBody := cleanProfanity(params.Body)
+
+	userID, err := uuid.Parse(params.UserID)
+	if err != nil {
+		log.Printf("Error parsing user ID: %s", err)
+		respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		return
+	}
+
+	chirpParams := database.CreateChirpParams{
+		Body:   cleanedBody,
+		UserID: userID,
+	}
+
+	chirp, err := cfg.queries.CreateChirp(r.Context(), chirpParams)
+	if err != nil {
+		log.Printf("Error creating chirp: %s", err)
+		respondWithError(w, http.StatusInternalServerError, "Error creating chirp")
+		return
+	}
+
+	responseChirp := Chirp{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+
+	json.NewEncoder(w).Encode(responseChirp)
 }
 
 func (cfg *apiConfig) validateChirp(w http.ResponseWriter, r *http.Request) {
