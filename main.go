@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -80,6 +82,10 @@ func main() {
 	newMux.HandleFunc("POST /api/refresh", cfg.handleRefresh)
 
 	newMux.HandleFunc("POST /api/revoke", cfg.handleRevoke)
+
+	newMux.HandleFunc("PUT /api/users", cfg.updateUser)
+
+	newMux.HandleFunc("DELETE /api/chirps/{chirpID}", cfg.authMiddleware(cfg.deleteChirp))
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -441,5 +447,135 @@ func (cfg *apiConfig) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPut {
+		respondWithError(w, http.StatusMethodNotAllowed, "Invalid request method")
+		return
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+		respondWithError(w, http.StatusUnauthorized, "Missing or malformed Authorization header")
+		return
+	}
+	Token := strings.TrimPrefix(authHeader, "Bearer ")
+
+	decoder := json.NewDecoder(r.Body)
+
+	defer r.Body.Close()
+
+	params := UpdateUserRequest{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+	if params.Email == "" {
+		respondWithError(w, http.StatusBadRequest, "Email must not be empty")
+		return
+	}
+	if params.Password == "" {
+		respondWithError(w, http.StatusBadRequest, "Password must not be empty")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(Token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid or expired token")
+		return
+	}
+
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to hash password")
+		return
+	}
+
+	err = cfg.queries.UpdateUserByID(r.Context(), database.UpdateUserByIDParams{
+		Email:          params.Email,
+		HashedPassword: hashedPassword,
+		ID:             userID,
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to update user")
+		return
+	}
+
+	response := map[string]string{
+		"id":    userID.String(),
+		"email": params.Email,
+	}
+	respondWithJSON(w, http.StatusOK, response)
+}
+
+func (cfg *apiConfig) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		tokenString, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+
+		userID, err := auth.ValidateJWT(tokenString, cfg.jwtSecret)
+		if err != nil {
+			respondWithError(w, http.StatusUnauthorized, "Invalid token")
+			return
+		}
+
+		user, err := cfg.queries.GetUserByID(r.Context(), userID)
+		if err != nil {
+			respondWithError(w, http.StatusUnauthorized, "Invalid user")
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), "user", user)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(r.URL.Path, "/")
+	if len(pathParts) < 4 {
+		respondWithError(w, http.StatusBadRequest, "Invalid URL")
+		return
+	}
+	chirpIDString := pathParts[3]
+
+	chirpID, err := uuid.Parse(chirpIDString)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
+		return
+	}
+
+	user := r.Context().Value("user").(database.User)
+
+	chirp, err := cfg.queries.GetSingleChirp(r.Context(), chirpID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusNotFound, "Chirp not found")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get chirp")
+		return
+	}
+
+	if chirp.UserID != user.ID {
+		respondWithError(w, http.StatusForbidden, "You can only delete your own chirps")
+		return
+	}
+
+	err = cfg.queries.DeleteChirp(r.Context(), database.DeleteChirpParams{
+		ID:     chirpID,
+		UserID: user.ID,
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't delete chirp")
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
