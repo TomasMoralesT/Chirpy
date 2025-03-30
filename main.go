@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,7 @@ type apiConfig struct {
 	queries        *database.Queries
 	platform       string
 	jwtSecret      string
+	polkakey       string
 }
 
 func main() {
@@ -44,6 +46,11 @@ func main() {
 		log.Fatal("JWT_SECRET is not set in .env file")
 	}
 
+	polkakey := os.Getenv("POLKA_KEY")
+	if polkakey == "" {
+		log.Fatal("POLKA_KEY is not set in .env file")
+	}
+
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal("Error opening database connection:", err)
@@ -56,6 +63,7 @@ func main() {
 		queries:        dbQueries,
 		platform:       os.Getenv("PLATFORM"),
 		jwtSecret:      jwtSecret,
+		polkakey:       polkakey,
 	}
 
 	newMux := http.NewServeMux()
@@ -86,6 +94,8 @@ func main() {
 	newMux.HandleFunc("PUT /api/users", cfg.updateUser)
 
 	newMux.HandleFunc("DELETE /api/chirps/{chirpID}", cfg.authMiddleware(cfg.deleteChirp))
+
+	newMux.HandleFunc("POST /api/polka/webhooks", cfg.handleWebhooks)
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -273,7 +283,21 @@ func cleanProfanity(msg string) string {
 
 func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 
-	dbChirps, err := cfg.queries.GetChirps(r.Context())
+	authorID := r.URL.Query().Get("author_id")
+
+	var dbChirps []database.Chirp
+	var err error
+
+	if authorID != "" {
+		authorUUID, parseErr := uuid.Parse(authorID)
+		if parseErr != nil {
+			respondWithError(w, http.StatusBadRequest, "Invalid author_id format")
+			return
+		}
+		dbChirps, err = cfg.queries.GetChirpsByAuthorID(r.Context(), authorUUID)
+	} else {
+		dbChirps, err = cfg.queries.GetChirps(r.Context())
+	}
 	if err != nil {
 		log.Printf("Error getting chirps: %s", err)
 		respondWithError(w, http.StatusInternalServerError, "Error getting chirps")
@@ -288,6 +312,23 @@ func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 			UpdatedAt: dbChirp.UpdatedAt,
 			UserID:    dbChirp.UserID,
 			Body:      dbChirp.Body,
+		})
+	}
+
+	sortParam := r.URL.Query().Get("sort")
+	log.Printf("Sort parameter: %s", sortParam)
+
+	if sortParam == "" || (sortParam != "asc" && sortParam != "desc") {
+		sortParam = "asc"
+	}
+
+	if sortParam == "asc" {
+		sort.Slice(chirps, func(i, j int) bool {
+			return chirps[i].CreatedAt.Before(chirps[j].CreatedAt)
+		})
+	} else {
+		sort.Slice(chirps, func(i, j int) bool {
+			return chirps[i].CreatedAt.After(chirps[j].CreatedAt)
 		})
 	}
 
@@ -343,6 +384,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 		Email        string    `json:"email"`
 		Token        string    `json:"token"`
 		RefreshToken string    `json:"refresh_token"`
+		IsChirpyRed  bool      `json:"is_chirpy_red"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -397,6 +439,7 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 		Email:        user.Email,
 		Token:        token,
 		RefreshToken: refreshToken,
+		IsChirpyRed:  user.IsChirpyRed,
 	})
 }
 
@@ -578,4 +621,59 @@ func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) handleWebhooks(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		respondWithError(w, http.StatusMethodNotAllowed, "Invalid request method")
+		return
+	}
+
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil || apiKey != cfg.polkakey {
+		respondWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	type webhookRequest struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID string `json:"user_id"`
+		} `json:"data"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	var payload webhookRequest
+	err = decoder.Decode(&payload)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if payload.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	userID, err := uuid.Parse(payload.Data.UserID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid user format")
+		return
+	}
+
+	_, err = cfg.queries.GetUserByID(r.Context(), userID)
+	if err != nil {
+
+		respondWithError(w, http.StatusNotFound, "User not found")
+		return
+	}
+	err = cfg.queries.UpgradeChirpyRedByID(r.Context(), userID)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to update user")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+
 }
